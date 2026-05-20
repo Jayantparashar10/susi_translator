@@ -11,6 +11,7 @@ import queue
 import torch
 import json
 import time
+import uuid
 import os
 from dotenv import load_dotenv
 
@@ -72,6 +73,40 @@ else:
 # In-memory storage for transcripts
 transcriptd = {} # should be a dictionary of dictionaries; the key is the tenant_id and the value is a dictionary with the chunk_id as key and the transcript as value
 audio_stack = queue.Queue() # is this a fifo queue? yes, it is, a FILO queue would be LifoQueue
+
+# Per-source "latest session" registry.
+# Each grabber run calls POST /session?source=<mic|file|url|stdin> at startup;
+# the server mints a fresh tenant_id (uuid) and remembers it as the latest
+# tenant_id for that source. Read endpoints accept ?source=<name> as a
+# convenience that resolves to the latest tenant_id for that source, so the
+# user never has to type or remember the uuid in curl commands.
+VALID_SOURCES = {"mic", "file", "url", "stdin"}
+latest_session_by_source = {s: None for s in VALID_SOURCES}
+session_lock = threading.Lock()
+
+
+def _resolve_tenant(args, default='0000'):
+    """
+    Resolve which tenant_id a read request is targeting.
+
+    Priority:
+      1. Explicit ?tenant_id=<id> wins (covers manual override / debugging).
+      2. ?source=<mic|file|url|stdin> resolves to the most recently
+         registered session for that source. If no session has been
+         registered yet for that source, returns None so the caller can
+         short-circuit with an empty response.
+      3. Fall back to ``default`` (legacy behaviour).
+    """
+    explicit = args.get('tenant_id')
+    if explicit:
+        return explicit
+    source = args.get('source')
+    if source:
+        if source not in VALID_SOURCES:
+            return None
+        with session_lock:
+            return latest_session_by_source.get(source)
+    return default
 
 # Process audio data
 def process_audio():
@@ -294,6 +329,54 @@ size_response_model = api.model('SizeResponse', {
     'size': fields.Integer(description='The number of transcripts')
 })
 
+session_input_model = api.model('SessionRequest', {
+    'source': fields.String(
+        required=True,
+        description='Input source name; one of: mic, file, url, stdin',
+        enum=sorted(VALID_SOURCES),
+    ),
+})
+
+session_response_model = api.model('SessionResponse', {
+    'tenant_id': fields.String(description='Server-minted tenant ID for this run'),
+    'source': fields.String(description='Source name this session is registered under'),
+})
+
+
+@api.route('/session')
+class Session(Resource):
+    @api.expect(session_input_model)
+    @api.response(200, 'Success', session_response_model)
+    @api.response(400, 'Invalid source')
+    def post(self):
+        '''
+        Start a new transcription session for an input source.
+
+        The grabber calls this once per run, passing its source name
+        (mic/file/url/stdin). The server mints a fresh tenant_id (uuid)
+        and records it as the latest session for that source. Subsequent
+        read requests using ?source=<name> resolve to this tenant_id, so
+        the user never has to know or type the uuid.
+        '''
+        try:
+            data = request.get_json(force=True, silent=True) or {}
+            source = data.get('source') or request.args.get('source')
+            if source not in VALID_SOURCES:
+                return {
+                    "error": f"source must be one of {sorted(VALID_SOURCES)}",
+                }, 400
+
+            new_tenant_id = uuid.uuid4().hex
+            with session_lock:
+                latest_session_by_source[source] = new_tenant_id
+
+            logger.info(f"New session for source={source}: tenant_id={new_tenant_id}")
+            return {"tenant_id": new_tenant_id, "source": source}, 200
+        except Exception as e:
+            logger.error("Error in /session", exc_info=True)
+            return {"error": str(e)}, 500
+
+
 @api.route('/transcribe')
 class Transcribe(Resource):
     @api.expect(transcribe_input_model)
@@ -342,7 +425,7 @@ class GetTranscript(Resource):
         The /get_transcript endpoint allows clients to retrieve the transcript for a given chunk_id.
         If the chunk_id is not found, an empty transcript is returned.
         '''
-        tenant_id = request.args.get('tenant_id', '0000')
+        tenant_id = _resolve_tenant(request.args)
         t = transcriptd.get(tenant_id, {})
         if len(t) == 0:
             return jsonify({'chunk_id': '-1', 'transcript': ''})
@@ -368,7 +451,7 @@ class GetFirstTranscript(Resource):
         '''
         Get first transcript endpoint: Retrieve the first transcript for a given tenant_id
         '''
-        tenant_id = request.args.get('tenant_id', '0000')
+        tenant_id = _resolve_tenant(request.args)
         t = transcriptd.get(tenant_id, {})
         if len(t) == 0:
             return jsonify({'chunk_id': '-1', 'transcript': ''})
@@ -393,7 +476,7 @@ class PopFirstTranscript(Resource):
         '''
         Pop first transcript endpoint: Retrieve and remove the first transcript for a given tenant_id
         '''
-        tenant_id = request.args.get('tenant_id', '0000')
+        tenant_id = _resolve_tenant(request.args)
         t = transcriptd.get(tenant_id, {})
         if len(t) == 0:
             return jsonify({'chunk_id': '-1', 'transcript': ''})
@@ -418,7 +501,7 @@ class GetLatestTranscript(Resource):
         '''
         Get latest transcript endpoint: Retrieve the latest transcript for a given tenant_id
         '''
-        tenant_id = request.args.get('tenant_id', '0000')
+        tenant_id = _resolve_tenant(request.args)
         t = transcriptd.get(tenant_id, {})
         if len(t) == 0:
             return jsonify({'chunk_id': '-1', 'transcript': ''})
@@ -443,7 +526,7 @@ class PopLatestTranscript(Resource):
         '''
         Get latest transcript endpoint: Retrieve and remove the latest transcript for a given tenant_id
         '''
-        tenant_id = request.args.get('tenant_id', '0000')
+        tenant_id = _resolve_tenant(request.args)
         t = transcriptd.get(tenant_id, {})
         if len(t) == 0:
             return jsonify({'chunk_id': '-1', 'transcript': ''})
@@ -467,7 +550,7 @@ class DeleteTranscript(Resource):
         '''
         delete a transcript for a given tenant_id and chunk_id 
         '''
-        tenant_id = request.args.get('tenant_id', '0000')
+        tenant_id = _resolve_tenant(request.args)
         t = transcriptd.get(tenant_id, {})
         sentences = request.args.get('sentences', default='false') == 'true'
         if sentences == 'true': t = merge_and_split_transcripts(t)
@@ -492,7 +575,7 @@ class ListTranscripts(Resource):
         '''
         list all transcripts for a given tenant_id
         '''
-        tenant_id = request.args.get('tenant_id', '0000')
+        tenant_id = _resolve_tenant(request.args)
         t = transcriptd.get(tenant_id, {})
         sentences = request.args.get('sentences', default='false') == 'true'
         if sentences == 'true': t = merge_and_split_transcripts(t)
@@ -515,7 +598,7 @@ class TranscriptsSize(Resource):
         '''
         get the size of the transcripts for a given tenant_id  
         '''
-        tenant_id = request.args.get('tenant_id', '0000')
+        tenant_id = _resolve_tenant(request.args)
         t = transcriptd.get(tenant_id, {})
         sentences = request.args.get('sentences', default='false') == 'true'
         if sentences == 'true': t = merge_and_split_transcripts(t)

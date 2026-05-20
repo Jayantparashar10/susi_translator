@@ -17,11 +17,29 @@ System requirements
 - ``url``   : the ``ffmpeg`` binary on PATH.
 - ``stdin`` : none beyond the standard library.
 
+Tenant IDs (auto-managed)
+-------------------------
+The grabber never asks the user for a tenant id. On startup it calls
+``POST /session`` with the chosen subcommand (``mic``/``file``/``url``/
+``stdin``); the server mints a fresh tenant_id (uuid) and records it as
+the latest session for that source.
+
+To fetch transcripts, curl with ``?source=<name>`` instead of
+``?tenant_id=...``::
+
+    curl "http://localhost:5040/pop_first_transcript?source=mic"
+    curl "http://localhost:5040/pop_first_transcript?source=file"
+
+The server resolves ``source=mic`` to "the most recent mic session", so
+each fresh run gives you a clean bucket of transcripts under that fixed
+curl command. ``--tenant <id>`` is still accepted as an explicit
+override (e.g. for reconnecting to a known session id).
+
 Examples
 --------
 ::
 
-    python audio_grabber.py mic --server http://localhost:5000 --tenant alice
+    python audio_grabber.py mic --server http://localhost:5040
     python audio_grabber.py file --path talk.mp3 --realtime
     python audio_grabber.py url  --url https://example.com/stream.mp3
     ffmpeg -i input.wav -f s16le -ac 1 -ar 16000 - | \\
@@ -35,6 +53,7 @@ import base64
 import struct
 import sys
 import time
+import uuid
 from typing import List, Optional
 
 import requests
@@ -57,8 +76,8 @@ SAMPLE_WIDTH: int = 2  # 16-bit
 BUFFER_SIZE: int = 2 * 10 * RATE  # bytes -> 10 seconds of audio
 SILENCE_THRESHOLD: int = 500
 
-DEFAULT_SERVER: str = "http://localhost:5000"
-DEFAULT_TENANT: str = "default"
+DEFAULT_SERVER: str = "http://localhost:5040"
+VALID_SOURCES = ("mic", "file", "url", "stdin")
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +167,40 @@ def _new_chunk_id() -> str:
     return str(int(time.time() * 1000))
 
 
+def _register_session(server: str, source: str) -> str:
+    """
+    Ask the server for a fresh tenant_id for this run.
+
+    Calls ``POST /session`` with ``{"source": <name>}``. The server mints
+    a uuid and records it as the latest session for that source, so curl
+    with ``?source=<name>`` will resolve to this run's transcripts.
+
+    Falls back to a locally-generated uuid if the server does not yet
+    implement ``/session`` (older builds), so the grabber still works,
+    just without the per-source ``?source=...`` resolution.
+    """
+    url = server.rstrip("/") + "/session"
+    try:
+        response = requests.post(url, json={"source": source}, timeout=10)
+        if response.status_code == 200:
+            payload = response.json()
+            tenant_id = payload.get("tenant_id")
+            if tenant_id:
+                return tenant_id
+        print(
+            f"Warning: /session returned HTTP {response.status_code}; "
+            f"falling back to a local uuid (curl with ?source={source} "
+            f"will not work for this run)."
+        )
+    except requests.exceptions.RequestException as exc:
+        print(
+            f"Warning: could not reach {url} ({exc}); falling back to a "
+            f"local uuid (curl with ?source={source} will not work for "
+            f"this run)."
+        )
+    return uuid.uuid4().hex
+
+
 # ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
@@ -234,8 +287,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--tenant",
-        default=DEFAULT_TENANT,
-        help=f"Tenant ID (default: {DEFAULT_TENANT}).",
+        default=None,
+        help=(
+            "Explicit tenant ID override. By default the grabber asks "
+            "the server for a fresh tenant ID per run via POST /session."
+        ),
     )
 
     sub = parser.add_subparsers(
@@ -302,7 +358,30 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
     source = _build_source(args)
-    run(source=source, server=args.server, tenant_id=args.tenant)
+
+    # Resolve the tenant_id for this run. If the user passed --tenant,
+    # honour it; otherwise ask the server to mint one and register it
+    # under this source name so `curl ...?source=<name>` will work.
+    if args.tenant:
+        tenant_id = args.tenant
+        registered = False
+    else:
+        tenant_id = _register_session(server=args.server, source=args.source)
+        registered = True
+
+    print("=" * 60)
+    print(f"  source:    {args.source}")
+    print(f"  tenant_id: {tenant_id}")
+    print(f"  server:    {args.server}")
+    if registered:
+        print(f"  curl:      curl \"{args.server.rstrip('/')}"
+              f"/pop_first_transcript?source={args.source}\"")
+    else:
+        print(f"  curl:      curl \"{args.server.rstrip('/')}"
+              f"/pop_first_transcript?tenant_id={tenant_id}\"")
+    print("=" * 60)
+
+    run(source=source, server=args.server, tenant_id=tenant_id)
     return 0
 
 
