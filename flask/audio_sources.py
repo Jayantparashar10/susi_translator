@@ -35,6 +35,15 @@ import time
 import queue
 from abc import ABC, abstractmethod
 from typing import Generator, Optional
+from urllib.parse import urlparse
+
+
+# Protocols ffmpeg is permitted to use when decoding a remote URL. Anything
+# outside this set (notably ``file``, ``concat``, ``pipe``, ``subfile`` and
+# friends) could be abused to read local resources, so it is rejected via
+# ffmpeg's ``-protocol_whitelist`` option.
+_ALLOWED_URL_SCHEMES: frozenset[str] = frozenset({"http", "https"})
+_FFMPEG_PROTOCOL_WHITELIST: str = "http,https,tcp,tls,crypto"
 
 
 # ---------------------------------------------------------------------------
@@ -299,14 +308,50 @@ class URLSource(AudioSource):
     """
 
     def __init__(self, url: str) -> None:
-        self._url: str = url
+        self._url: str = self._validate_url(url)
         self._proc: Optional[subprocess.Popen] = None
         self._running: bool = False
 
+    @staticmethod
+    def _validate_url(url: str) -> str:
+        """
+        Enforce that ``url`` is a well-formed HTTP(S) URL before it is ever
+        handed to ffmpeg.
+
+        This is the first line of defence against the security audit
+        finding on the ``subprocess.Popen`` call below: by the time the
+        URL reaches ffmpeg we have already guaranteed it is not an option
+        flag (e.g. ``-something``) and not a non-network scheme such as
+        ``file://`` or ``concat:`` that could be used to read local
+        resources.
+        """
+        if not isinstance(url, str) or not url:
+            raise ValueError("URLSource: url must be a non-empty string")
+        # Reject anything that could be parsed as an option flag by ffmpeg
+        # before the scheme check, just to be explicit.
+        if url.startswith("-"):
+            raise ValueError("URLSource: url must not start with '-'")
+        parsed = urlparse(url)
+        if parsed.scheme.lower() not in _ALLOWED_URL_SCHEMES:
+            raise ValueError(
+                f"URLSource: unsupported URL scheme {parsed.scheme!r}; "
+                f"allowed schemes are {sorted(_ALLOWED_URL_SCHEMES)}"
+            )
+        if not parsed.netloc:
+            raise ValueError("URLSource: url must include a host")
+        return url
+
     def start(self) -> None:
+        # SECURITY: ``self._url`` has been validated by ``_validate_url`` to
+        # be an http(s) URL with a host and no leading ``-``. We invoke
+        # ffmpeg with a fixed argv list (``shell=False``) and additionally
+        # pass ``-protocol_whitelist`` so ffmpeg itself refuses any nested
+        # redirect to a non-network protocol. This addresses the static
+        # analysis warning about a non-static argument to ``subprocess.Popen``.
         cmd = [
             "ffmpeg",
             "-loglevel", "error",
+            "-protocol_whitelist", _FFMPEG_PROTOCOL_WHITELIST,
             "-i", self._url,
             "-f", "s16le",
             "-acodec", "pcm_s16le",
@@ -314,10 +359,11 @@ class URLSource(AudioSource):
             "-ar", str(self.SAMPLE_RATE),
             "-",  # write to stdout
         ]
-        self._proc = subprocess.Popen(
+        self._proc = subprocess.Popen(  # noqa: S603  # validated argv, shell=False
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
+            shell=False,
         )
         self._running = True
 
@@ -363,7 +409,7 @@ class StdinSource(AudioSource):
     Useful for piping arbitrary tools into the grabber, e.g.::
 
         ffmpeg -i input.flac -f s16le -ac 1 -ar 16000 - | \\
-            python audio_grabber.py stdin --server http://localhost:5000
+            python audio_grabber.py stdin --server http://localhost:5040
 
     System requirements
     -------------------

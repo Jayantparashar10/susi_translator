@@ -81,7 +81,7 @@ VALID_SOURCES = ("mic", "file", "url", "stdin")
 
 
 # ---------------------------------------------------------------------------
-# Silence detection (same semantics as the original is_silent)
+# Silence detection (absolute-peak variant of the original is_silent)
 # ---------------------------------------------------------------------------
 
 def _is_silent(pcm_bytes: bytes) -> bool:
@@ -89,8 +89,14 @@ def _is_silent(pcm_bytes: bytes) -> bool:
     Return True if the loudest sample in ``pcm_bytes`` is below
     ``SILENCE_THRESHOLD``.
 
-    Mirrors the original ``AudioGrabber.is_silent`` check, but uses the
-    absolute peak (so loud negative excursions count too).
+    Behaviour note
+    --------------
+    The original ``AudioGrabber.is_silent`` (see ``audio_grabber.html``) used
+    ``Math.max(...data)``, i.e. the signed maximum, which would mis-classify
+    buffers whose loudest excursions are negative as "silent". This
+    implementation intentionally uses ``max(abs(s) for s in samples)`` so
+    that loud negative excursions count too. Callers that depend on strict
+    bit-for-bit parity with the JS check should be aware of this difference.
     """
     if not pcm_bytes:
         return True
@@ -112,6 +118,12 @@ def _build_session() -> requests.Session:
         total=5,
         backoff_factor=1,
         status_forcelist=[500, 502, 503, 504],
+        # urllib3's default allowed_methods does NOT include POST, so the
+        # /transcribe upload would otherwise never be retried. POST retries
+        # are safe here because the server contract is idempotent on
+        # ``chunk_id`` (a re-sent body for the same chunk_id simply
+        # overwrites the previous one).
+        allowed_methods=frozenset(["HEAD", "GET", "PUT", "DELETE", "OPTIONS", "TRACE", "POST"]),
     )
     adapter = HTTPAdapter(max_retries=retry_policy)
     session = requests.Session()
@@ -229,8 +241,8 @@ def run(source: AudioSource, server: str, tenant_id: str) -> None:
     buffer = bytearray()
     chunk_id: str = _new_chunk_id()
 
-    source.start()
     try:
+        source.start()
         for pcm in source.read_chunk():
             if _is_silent(pcm):
                 # The buffer last sent is now the final state of this
