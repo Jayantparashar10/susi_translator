@@ -1,5 +1,3 @@
-"""Tests for _pcm_int16_to_wav_bytes and merge_and_split_transcripts."""
-
 from __future__ import annotations
 
 import io
@@ -8,19 +6,13 @@ import wave
 import numpy as np
 
 
-# ---------------------------------------------------------------------------
-# _pcm_int16_to_wav_bytes
-# ---------------------------------------------------------------------------
-
 def test_pcm_to_wav_round_trips_via_wave_module(ts):
     pcm = (np.sin(np.linspace(0, 6.28, 16000)) * 8000).astype(np.int16)
     wav = ts._pcm_int16_to_wav_bytes(pcm, sample_rate=16000)
 
-    # Begins with a RIFF/WAVE header.
     assert wav[:4] == b"RIFF"
     assert wav[8:12] == b"WAVE"
 
-    # Re-open with the wave module and confirm the parameters round-trip.
     with wave.open(io.BytesIO(wav), "rb") as wf:
         assert wf.getnchannels() == 1
         assert wf.getsampwidth() == 2
@@ -36,15 +28,7 @@ def test_pcm_to_wav_handles_empty_input(ts):
         assert wf.getnframes() == 0
 
 
-# ---------------------------------------------------------------------------
-# merge_and_split_transcripts
-# ---------------------------------------------------------------------------
-
 def test_merge_returns_dict_shape_not_strings(ts):
-    """
-    Regression: the original implementation returned ``{key: str}`` which
-    crashed downstream callers expecting ``{key: {'transcript': str}}``.
-    """
     inp = {"100": {"transcript": "Hello world."}}
     out = ts.merge_and_split_transcripts(inp)
     assert isinstance(out["100"], dict)
@@ -52,11 +36,6 @@ def test_merge_returns_dict_shape_not_strings(ts):
 
 
 def test_merge_handles_dict_values_without_attributeerror(ts):
-    """
-    Regression: the original called ``.strip()`` on dict values directly,
-    which raised AttributeError. This test would have crashed under the
-    pre-fix code.
-    """
     inp = {
         "100": {"transcript": "Hello world this is"},
         "200": {"transcript": "a test. And more."},
