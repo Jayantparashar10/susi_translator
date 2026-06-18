@@ -171,7 +171,7 @@ class TestPipelineExecutionAndErrors:
 
         registry.configure("tenant1", None, {"provider_name": "failing_nmt", "config": {"break_on_init": True}})
 
-        with pytest.raises(RuntimeError, match="missing heavy ML weights"):
+        with pytest.raises(ProviderConfigError, match="Provider initialization failed for 'failing_nmt': missing heavy ML weights"):
             registry.translate("tenant1", "hello", "en", "es")
 
 
@@ -275,4 +275,5 @@ class TestWhisperSSLScope:
              patch("whisper.load_model", return_value=MagicMock()):
             provider.load_model()
 
-        assert not (ssl.create_default_context().options & 0x4)
+        assert not (ssl.create_default_context().options & 0x4)
+

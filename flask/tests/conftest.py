@@ -4,6 +4,7 @@ import os
 import sys
 
 import pytest
+from flask_jwt_extended import create_access_token
 
 # Make `flask/` importable so tests can `import transcribe_server`.
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -11,15 +12,13 @@ _FLASK_DIR = os.path.abspath(os.path.join(_HERE, ".."))
 if _FLASK_DIR not in sys.path:
     sys.path.insert(0, _FLASK_DIR)
 
-# Pin env BEFORE importing transcribe_server (it reads these at import time).
-# Override (not setdefault) so a developer's shell can't pull in heavy deps
-# or flip on debug mode.
 os.environ["WHISPER_SERVER_USE"] = "true"
 os.environ["FLASK_DEBUG"] = "false"
 os.environ["FLASK_HOST"] = "127.0.0.1"
 os.environ["CORS_ALLOWED_ORIGINS"] = "http://localhost:5040"
 os.environ["SESSION_TTL_SECONDS"] = "7200"
 os.environ["TRANSCRIBE_AUTOSTART_WORKER"] = "false"
+os.environ["JWT_SECRET_KEY"] = "testing-secret-key-that-is-long-enough"
 
 
 @pytest.fixture
@@ -38,11 +37,42 @@ def ts():
         except Exception:
             break
 
+    with ts_mod.grabber_lock:
+        ts_mod.grabber_processes.clear()
+
     return ts_mod
+
+
+@pytest.fixture(autouse=True)
+def setup_db(ts):
+    """Ensure every test runs on a fresh, isolated in-memory database."""
+    ts.app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///:memory:"
+    with ts.app.app_context():
+        ts.db.create_all()
+        yield
+        ts.db.session.remove()
+        ts.db.drop_all()
+
+
+@pytest.fixture
+def unauth_client(ts):
+    """An unauthenticated test client."""
+    ts.app.config["TESTING"] = True
+    with ts.app.test_client() as c:
+        yield c
 
 
 @pytest.fixture
 def client(ts):
+    """An automatically authenticated test client acting as an admin."""
     ts.app.config["TESTING"] = True
     with ts.app.test_client() as c:
+        with ts.app.app_context():
+            from auth.models import Organizer
+            user = Organizer(email="testadmin@localhost.com", password_hash="dummy", is_admin=True)
+            ts.db.session.add(user)
+            ts.db.session.commit()
+            
+            token = create_access_token(identity=user.email)
+            c.set_cookie('access_token_cookie', token)
         yield c
